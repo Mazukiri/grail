@@ -9,14 +9,16 @@ Communication per chunk: 3 all-reduces of shape ``[B, chunk]`` (tiny),
 instead of a 1.86 GB vocab all-gather.
 
 Uses ``torch.distributed.nn.functional.all_reduce`` (the differentiable
-version) so that gradients flow correctly through the softmax normalisation
-during the current-policy forward pass.
+version) so that gradients flow through the softmax normalisation during the
+current-policy forward pass. The max shift is detached (it takes no gradient),
+and the outputs' gradients are scaled by ``1 / tp_size`` because every TP rank
+backprops the same loss.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 import torch.distributed as dist
@@ -43,6 +45,24 @@ def _differentiable_all_reduce(
     if isinstance(result, tuple):
         return result[0]
     return result  # type: ignore[return-value]
+
+
+class _ScaleGrad(torch.autograd.Function):
+    """Identity in the forward pass; multiplies the gradient by ``scale`` in the backward pass."""
+
+    @staticmethod
+    def forward(ctx: Any, tensor: torch.Tensor, scale: float) -> torch.Tensor:
+        ctx.scale = scale
+        return tensor.clone()
+
+    @staticmethod
+    def backward(ctx: Any, grad_output: torch.Tensor) -> tuple[torch.Tensor, None]:
+        return grad_output * ctx.scale, None
+
+
+def _scale_grad(tensor: torch.Tensor, scale: float) -> torch.Tensor:
+    """``tensor`` in the forward pass; its gradient multiplied by ``scale`` in the backward pass."""
+    return cast(torch.Tensor, _ScaleGrad.apply(tensor, scale))
 
 
 logger = logging.getLogger(__name__)
@@ -119,12 +139,13 @@ def tp_chunked_logprobs(
         # (b) Cast to fp32 for numerically stable logsumexp
         chunk_logits = chunk_logits.float()  # [B, C, V_local]
 
-        # (c) Local max, then differentiable all-reduce MAX across TP group.
-        # We use torch.distributed.nn.functional.all_reduce which participates
-        # in autograd, ensuring correct gradients through the softmax
-        # normalisation for the current policy forward pass.
+        # (c) Local max, then all-reduce MAX across the TP group. The max is only a shift:
+        # logsumexp, log-softmax and entropy do not depend on it, so it takes no gradient
+        # (torch.distributed.nn's MAX all-reduce has no correct backward, pytorch/pytorch#58005).
         local_max, _ = chunk_logits.max(dim=-1)  # [B, C]
-        global_max = _differentiable_all_reduce(local_max, op=dist.ReduceOp.MAX, group=tp_group)
+        global_max = _differentiable_all_reduce(
+            local_max.detach(), op=dist.ReduceOp.MAX, group=tp_group
+        )
 
         # (d) Shift logits, compute local exp sum, differentiable all-reduce SUM
         shifted_logits = chunk_logits - global_max.unsqueeze(-1)  # [B, C, V_local]
@@ -199,6 +220,13 @@ def tp_chunked_logprobs(
                 if entropy_per_token is not None:
                     entropy_per_token[idx, :plen] = 0.0
 
+    # Every TP rank computes the same loss from these outputs and backprops it, and the backward
+    # of each SUM all-reduce above adds the ranks' gradients. Scaling the outputs' gradients by
+    # 1/tp_size makes that sum the gradient of one loss (the convention of the DTensor-parallel
+    # model around this function) instead of tp_size times it.
+    token_log_probs = _scale_grad(token_log_probs, 1.0 / tp_size)
+    if entropy_per_token is not None:
+        entropy_per_token = _scale_grad(entropy_per_token, 1.0 / tp_size)
     return token_log_probs, entropy_per_token
 
 

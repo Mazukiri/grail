@@ -910,6 +910,9 @@ class DistributedTrainingService:
 
         tp_group = self._tp_group
         chunk_size = self.train_config.logit_chunk_size
+        # Only the policy is tensor-parallel: the reference model is replicated on every rank
+        # (setup_ref_model), and its full-vocab logits must not go through the TP reduction.
+        tp_model = self.train_model
 
         # Wrapper for the padded (non-packed) path
         def _tp_compute_logprobs(
@@ -928,6 +931,21 @@ class DistributedTrainingService:
             | tuple[torch.Tensor, torch.Tensor]
             | tuple[torch.Tensor, torch.Tensor, torch.Tensor]
         ):
+            if model is not tp_model:
+                # Every model other than the TP policy (e.g. the reference model) has an unsharded
+                # lm_head: the TP path would count its full vocabulary once per TP rank, shifting
+                # every log-prob by -log(tp_size).
+                return originals["compute_logprobs"](
+                    model,
+                    input_ids,
+                    attention_mask,
+                    prompt_lengths,
+                    completion_lengths,
+                    return_per_token=return_per_token,
+                    return_entropy=return_entropy,
+                    chunked=chunked,
+                    chunk_size=chunk_size,
+                )
             logprobs_sum, logprobs_pt, entropies = compute_logprobs_distributed(
                 model,
                 input_ids,
